@@ -1,3 +1,0 @@
-numpy>=1.24
-# optional, for the ML polyphonic engine (final boss):
-# basic-pitch>=0.3

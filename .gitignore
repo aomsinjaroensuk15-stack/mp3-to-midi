@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-*.mid
-*.wav
-!tests/*.wav
-build/
-dist/
-*.egg-info/
-.venv/

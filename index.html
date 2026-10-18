@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>mp3 → midi 🎹 full</title>
+<title>mp3 → midi 🎹 PRO</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0d14; color: #eaeaf2; min-height: 100vh;
@@ -48,7 +48,7 @@
 </head>
 <body>
   <h1>mp3 <span>→</span> midi <span>🎹</span> full</h1>
-  <div class="sub">transcribe in your browser · 🎧 test-place: hear it + see it before you download · v1.0-web</div>
+  <div class="sub">🧠 neural transcription (Google Onsets &amp; Frames) + ⚙ classic DSP fallback · runs fully in your browser · v2.0-pro</div>
 
   <div id="drop">
     <div class="big">🎵</div>
@@ -58,6 +58,12 @@
   </div>
 
   <div class="opts">
+    <label>engine
+      <select id="engine">
+        <option value="neural" selected>🧠 neural — best quality (needs internet once)</option>
+        <option value="dsp">⚙ classic DSP — offline</option>
+      </select>
+    </label>
     <label>quality
       <select id="quality">
         <option value="drop" selected>drop (fast EDM / note spam)</option>
@@ -74,7 +80,10 @@
         <option value="5">E.Piano 1</option>
       </select>
     </label>
-    <label><input type="checkbox" id="quantize" checked> quantize 16ths</label>
+    <label>grid
+      <select id="grid"><option value="4" selected>16ths</option><option value="2">8ths</option></select>
+    </label>
+    <label><input type="checkbox" id="quantize" checked> quantize to grid</label>
     <label><input type="checkbox" id="handsplit" checked> hand split 🙌</label>
   </div>
 
@@ -82,6 +91,7 @@
     <button id="go" disabled>convert 🎹</button>
     <button id="demo" class="ghost">🎧 demo song</button>
     <button id="selftest" class="ghost">🔬 self-test</button>
+    <span id="modelstatus" style="align-self:center;font-size:.8rem;color:#8a8aa0;">🧠 model: not loaded</span>
     <button id="play" class="ghost" disabled>▶ play result</button>
     <button id="stop" class="ghost" disabled>⏹ stop</button>
   </div>
@@ -97,7 +107,7 @@
     <div class="playerrow"><span id="playstate">press ▶ play result to hear the transcription</span></div>
   </div>
 
-  <div class="foot">hand-rolled fft · spectral flux · semitone peaks · harmonic pruning · quantize · smf writer · webaudio synth<br>if mp3 decode fails on this page: convert to .wav first (decode uses your browser's built-in decoder)</div>
+  <div class="foot">hand-rolled fft · spectral flux · semitone peaks · harmonic pruning · quantize · smf writer · webaudio synth<br>🧠 neural engine loads Google Magenta Onsets&amp;Frames from CDN on first use (~1 min, then cached by browser) · if CDN unreachable it auto-falls back to classic DSP</div>
 
 <script>
 "use strict";
@@ -343,8 +353,24 @@ function estimateBpm(onsetFrames, hop) {
   while (bpm > 200) bpm /= 2;
   return bpm;
 }
-function quantizeNotes(notes, bpm) {
-  const gridTicks = TPQ / 4, spt = 60 / bpm / TPQ;
+function estimateBpmNotes(notes) {
+  const starts = [...new Set(notes.map(n => Math.round(n.start * 100)))].sort((a, b) => a - b);
+  const iois = [];
+  for (let i = 1; i < starts.length; i++) {
+    const d = (starts[i] - starts[i - 1]) / 100;
+    if (d > 0.08 && d < 2.5) iois.push(d);
+  }
+  if (iois.length < 3) return 120;
+  iois.sort((a, b) => a - b);
+  let bpm = 60 / iois[iois.length >> 1];
+  if (Math.abs(bpm - Math.round(bpm)) < 2.5) bpm = Math.round(bpm);
+  while (bpm < 60) bpm *= 2;
+  while (bpm > 210) bpm /= 2;
+  return bpm;
+}
+
+function quantizeNotes(notes, bpm, gridDiv) {
+  const gridTicks = Math.max(1, TPQ / (gridDiv || 4)), spt = 60 / bpm / TPQ;
   return notes.map(n => {
     const s = Math.round(n.start / spt / gridTicks) * gridTicks;
     const e = Math.max(s + gridTicks, Math.round(n.end / spt / gridTicks) * gridTicks);
@@ -471,6 +497,74 @@ function playNotes(notes) {
              (total + 0.5) * 1000);
 }
 
+/* ================= neural engine (Google Magenta Onsets & Frames) ================= */
+const CHECKPOINT = "https://storage.googleapis.com/magentadata/js/checkpoints/transcription/onsets_frames_uni";
+let oaf = null, modelLoading = null;
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error("could not load " + src.split("/").pop() + " (offline?)"));
+    document.head.appendChild(s);
+  });
+}
+async function ensureModel() {
+  if (oaf) return oaf;
+  if (modelLoading) return modelLoading;
+  modelLoading = (async () => {
+    log("loading tensorflow.js + magenta from CDN…");
+    await loadScript("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js");
+    await loadScript("https://cdn.jsdelivr.net/npm/@magenta/music@1.23.1/es6/index.js");
+    if (!window.mm || !window.mm.OnsetsAndFrames)
+      throw new Error("magenta library did not initialize");
+    log("loading transcription model weights (one-time, ~1 min)…");
+    const m = new window.mm.OnsetsAndFrames(CHECKPOINT);
+    await m.initialize();
+    $("modelstatus").textContent = "🧠 model: ready ✅";
+    oaf = m;
+    return m;
+  })();
+  try {
+    return await modelLoading;
+  } catch (e) {
+    modelLoading = null;
+    throw e;
+  }
+}
+function nsToNotes(ns) {
+  const raw = [];
+  for (const n of (ns.notes || [])) {
+    if (!(n.pitch >= 15 && n.pitch <= 115)) continue;      // garbage range -> drop
+    const start = n.startTime || 0;
+    let end = n.endTime || start + 0.1;
+    if (!(end > start)) continue;
+    end = Math.min(end, start + 4);
+    raw.push({ start, end, pitch: Math.max(0, Math.min(127, Math.round(n.pitch))),
+               vel: Math.max(30, Math.min(127, Math.round(n.velocity || 80))) });
+  }
+  raw.sort((a, b) => a.pitch - b.pitch || a.start - b.start);
+  const out = [];
+  for (const n of raw) {           // drop exact duplicates the model sometimes emits
+    const p = out[out.length - 1];
+    if (p && p.pitch === n.pitch && Math.abs(p.start - n.start) < 0.02 &&
+        Math.abs(p.end - n.end) < 0.06) continue;
+    out.push(n);
+  }
+  return out;
+}
+async function transcribeNeural(file) {
+  const model = await ensureModel();
+  log("🧠 neural transcription running — a 3-4 min song can take 30-120 s, keep this tab open…");
+  const t0 = performance.now();
+  const ns = await model.transcribeFromAudioFile(file);
+  const notes = nsToNotes(ns);
+  log("🧠 neural engine extracted " + notes.length + " notes in " +
+      ((performance.now() - t0) / 1000).toFixed(0) + "s");
+  const dur = (ns.totalTime && ns.totalTime > 1) ? ns.totalTime
+            : Math.max(1, ...notes.map(n => n.end));
+  return { notes, duration: dur };
+}
+
 /* ================= orchestration ================= */
 async function transcribeBuffer(raw, label) {
   const cfg = { ...PRESETS[$("quality").value] };
@@ -484,14 +578,20 @@ async function transcribeBuffer(raw, label) {
   setProg(0.9); await tick();
   let notes = trackPoly(onsetFrames, feats.S, feats.frames, cfg);
   let bpm = parseFloat($("bpm").value) || estimateBpm(onsetFrames, cfg.hop);
-  if ($("quantize").checked) notes = quantizeNotes(notes, bpm);
   notes.sort((a, b) => a.start - b.start || a.pitch - b.pitch);
   setProg(0.97); await tick();
   return { notes, bpm, cfg, duration: raw.length / SR };
 }
 
 function finish(result, label) {
-  const { notes, bpm, cfg, duration } = result;
+  let notes = result.notes;
+  if ($("quantize").checked) {
+    const gridDiv = parseInt($("grid").value) || 4;
+    notes = quantizeNotes(notes, result.bpm, gridDiv);
+    notes.sort((a, b) => a.start - b.start || a.pitch - b.pitch);
+  }
+  result.notes = notes;
+  const { bpm, duration } = result;
   lastResult = result;
   if (!notes.length) {
     log("no notes detected 😢 — try: louder file, different quality preset, or set BPM manually", true);
@@ -523,8 +623,21 @@ function finish(result, label) {
 async function handleFile(file) {
   $("log").innerHTML = ""; $("stats").style.display = "none"; $("dl").style.display = "none";
   $("stage").style.display = "none"; $("play").disabled = true; $("stop").disabled = true;
-  log("decoding " + file.name + " …");
+  const useNeural = $("engine").value === "neural";
   try {
+    if (useNeural) {
+      try {
+        const result = await transcribeNeural(file);
+        result.bpm = parseFloat($("bpm").value) || estimateBpmNotes(result.notes);
+        finish(result, file.name);
+        return;
+      } catch (e) {
+        log("🧠 neural engine failed: " + e.message, true);
+        log("falling back to ⚙ classic DSP… (or fix internet and retry)");
+      }
+    }
+    // ---- classic DSP path ----
+    log("decoding " + file.name + " …");
     const buf = await file.arrayBuffer();
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) throw new Error("WebAudio not supported in this browser 😢");
@@ -655,6 +768,5 @@ $("selftest").addEventListener("click", selfTest);
 $("play").addEventListener("click", () => lastResult && playNotes(lastResult.notes));
 $("stop").addEventListener("click", stopPlayback);
 </script>
-
 </body>
 </html>

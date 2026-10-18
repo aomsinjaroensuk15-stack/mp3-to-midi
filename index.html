@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>mp3 → midi 🎹 PRO</title>
+<title>mp3 → midi 🎹 PRO v3</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d0d14; color: #eaeaf2; min-height: 100vh;
@@ -48,7 +48,7 @@
 </head>
 <body>
   <h1>mp3 <span>→</span> midi <span>🎹</span> full</h1>
-  <div class="sub">🧠 neural transcription (Google Onsets &amp; Frames) + ⚙ classic DSP fallback · runs fully in your browser · v2.0-pro</div>
+  <div class="sub">🧠 neural transcription (Google Onsets &amp; Frames) + ⚙ classic DSP fallback · runs fully in your browser · v3.0-pro</div>
 
   <div id="drop">
     <div class="big">🎵</div>
@@ -104,7 +104,12 @@
   <div id="stage">
     <h3>🎼 test place — piano roll (🫲 left teal · 🫱 right purple)</h3>
     <canvas id="roll" width="1480" height="440"></canvas>
-    <div class="playerrow"><span id="playstate">press ▶ play result to hear the transcription</span></div>
+    <div class="playerrow">
+      <span id="playstate">press ▶ play result to hear the transcription</span>
+      <button id="refbtn" class="ghost" style="padding:6px 14px;font-size:.78rem;">📐 load reference .mid</button>
+      <input type="file" id="reffile" accept=".mid,.midi,audio/midi" hidden>
+      <span id="refstats" style="font-size:.78rem;color:#8a8aa0;"></span>
+    </div>
   </div>
 
   <div class="foot">hand-rolled fft · spectral flux · semitone peaks · harmonic pruning · quantize · smf writer · webaudio synth<br>🧠 neural engine loads Google Magenta Onsets&amp;Frames from CDN on first use (~1 min, then cached by browser) · if CDN unreachable it auto-falls back to classic DSP</div>
@@ -380,6 +385,160 @@ function quantizeNotes(notes, bpm, gridDiv) {
 </script>
 <script>
 "use strict";
+/* ================= WAV encoder (feeds segments to the model) ================= */
+function encodeWav(samples, sr) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); wstr(8, "WAVE");
+  wstr(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wstr(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, Math.round(s * 32767), true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+/* ================= segmented neural transcription (long songs) ================= */
+function dedupSegments(notes) {
+  notes.sort((a, b) => a.pitch - b.pitch || a.start - b.start);
+  const out = [], lastByPitch = new Map();
+  for (const n of notes) {
+    const p = lastByPitch.get(n.pitch);
+    if (p && n.start - p.start < 0.15) { p.end = Math.max(p.end, n.end); continue; }
+    out.push(n);
+    lastByPitch.set(n.pitch, n);
+  }
+  return out;
+}
+
+async function transcribeNeuralAny(raw, origSr) {
+  const model = await ensureModel();
+  const y = resampleTo(raw, origSr, 16000);
+  const total = y.length / 16000;
+  if (total > 600) log("⚠ that's a " + (total / 60).toFixed(1) + " min song — this will take a while…");
+  let all = [];
+  const SEG = 30, OV = 2;                          // 30s chunks, 2s overlap
+  if (total <= SEG) {
+    log("🧠 single-shot neural transcription…");
+    const ns = await model.transcribeFromAudioFile(encodeWav(y, 16000));
+    all = nsToNotes(ns);
+  } else {
+    const nSeg = Math.ceil(total / SEG);
+    log("🧠 long song → " + nSeg + " segments × " + SEG + "s (overlap " + OV + "s)");
+    for (let i = 0; i < nSeg; i++) {
+      const s0 = Math.floor(i * SEG * 16000);
+      const s1 = Math.min(y.length, Math.floor(((i + 1) * SEG + OV) * 16000));
+      log("  segment " + (i + 1) + "/" + nSeg + " @ " + (s0 / 16000).toFixed(0) + "s …");
+      const ns = await model.transcribeFromAudioFile(encodeWav(y.subarray(s0, s1), 16000));
+      const off = s0 / 16000;
+      for (const n of nsToNotes(ns))
+        all.push({ ...n, start: n.start + off, end: n.end + off });
+      setProg(0.08 + 0.8 * (i + 1) / nSeg);
+      await tick();
+    }
+    all = dedupSegments(all);
+  }
+  log("🧠 extracted " + all.length + " notes from " + total.toFixed(1) + "s of audio");
+  return { notes: all.sort((a, b) => a.start - b.start || a.pitch - b.pitch), duration: total };
+}
+
+/* ================= reference SMF parser (format 0/1, running status, tempo map) ================= */
+function parseRefMidi(bytes) {
+  const dv = new DataView(bytes.buffer || bytes);
+  const u8 = new Uint8Array(bytes.buffer || bytes);
+  if (String.fromCharCode(...u8.slice(0, 4)) !== "MThd")
+    throw new Error("not a MIDI file");
+  const hlen = dv.getUint32(4);
+  const div = dv.getUint16(12);
+  let pos = 8 + hlen;
+  const tempos = [], raw = [];
+  while (pos + 8 <= u8.length) {
+    const tag = String.fromCharCode(...u8.slice(pos, pos + 4));
+    const len = dv.getUint32(pos + 4);
+    const body = u8.subarray(pos + 8, pos + 8 + len);
+    pos += 8 + len;
+    if (tag !== "MTrk") continue;
+    let i = 0, tick = 0, status = 0;
+    const open = new Map();
+    const rdVar = () => { let r = 0, b; do { b = body[i++]; r = (r << 7) | (b & 0x7f); } while (b & 0x80); return r; };
+    while (i < body.length) {
+      tick += rdVar();
+      let b = body[i];
+      if (b === 0xff) {
+        const meta = body[++i]; i++;
+        const ln = rdVar();
+        if (meta === 0x51 && ln === 3)
+          tempos.push([tick, (body[i] << 16) | (body[i + 1] << 8) | body[i + 2]]);
+        i += ln;
+      } else if (b === 0xf0 || b === 0xf7) {
+        i++;
+        const ln = rdVar(); i += ln;
+      } else {
+        if (b & 0x80) { status = b; i++; }
+        const ev = status & 0xf0;
+        const d1 = body[i++];
+        let d2 = 0;
+        if (ev !== 0xc0 && ev !== 0xd0) d2 = body[i++];
+        if (ev === 0x90 && d2 > 0) {
+          if (!open.has(d1)) open.set(d1, []);
+          open.get(d1).push([tick, d2]);
+        } else if (ev === 0x80 || (ev === 0x90 && d2 === 0)) {
+          const q = open.get(d1);
+          if (q && q.length) {
+            const [st, vel] = q.shift();
+            if (tick > st) raw.push([st, tick, d1, vel]);
+          }
+        }
+      }
+    }
+  }
+  tempos.sort((a, b) => a[0] - b[0]);
+  if (!tempos.length) tempos.push([0, 500000]);
+  if (tempos[0][0] > 0) tempos.unshift([0, 500000]);
+  const tick2sec = tk => {
+    let sec = 0, ct = 0, cu = 500000;
+    for (const [tt, us] of tempos) {
+      if (tt > tk) break;
+      sec += (tt - ct) * cu / 1e6 / div;
+      ct = tt; cu = us;
+    }
+    return sec + (tk - ct) * cu / 1e6 / div;
+  };
+  return raw.map(([a, b2, p, v]) => ({
+    start: tick2sec(a), end: tick2sec(b2), pitch: p, vel: v }));
+}
+
+/* ================= detected-vs-reference scoring ================= */
+function compareToRef(det, ref) {
+  if (!det.length || !ref.length) return null;
+  const pool = ref.slice().sort((a, b) => a.start - b.start);
+  const used = new Set();
+  let matched = 0;
+  for (const n of det) {
+    let best = -1, bestD = 1e9;
+    for (let i = 0; i < pool.length; i++) {
+      const r = pool[i];
+      if (used.has(i)) continue;
+      const d = Math.abs(r.start - n.start);
+      if (d > 0.08) continue;
+      const dp = Math.abs(r.pitch - n.pitch);
+      if (dp > 1) continue;
+      const cost = d + dp * 0.05;
+      if (cost < bestD) { bestD = cost; best = i; }
+    }
+    if (best >= 0) { used.add(best); matched++; }
+  }
+  return { matched, precision: matched / det.length, recall: matched / ref.length };
+}
+</script>
+
+<script>
+"use strict";
 /* ================= pure-JS MIDI file writer ================= */
 function varlen(n) {
   n = Math.max(0, Math.round(n));
@@ -428,7 +587,7 @@ function buildMidi(notes, bpm, program, handSplit) {
 
 /* ================= test place #1: piano roll ================= */
 let lastResult = null;
-function drawRoll(notes, duration) {
+function drawRoll(notes, duration, refNotes) {
   const cv = $("roll");
   if (!cv || !cv.getContext) return;
   const g = cv.getContext("2d");
@@ -444,6 +603,16 @@ function drawRoll(notes, duration) {
     const black = [1,3,6,8,10].includes(p % 12);
     g.fillStyle = black ? "#16161f" : "#1d1d2a";
     g.fillRect(0, H - (p - pMin + 1) * keyH, W, keyH);
+  }
+  if (refNotes && refNotes.length) {          // reference: faint white behind
+    g.fillStyle = "#ffffff";
+    for (const n of refNotes) {
+      if (n.pitch < pMin || n.pitch > pMax) continue;
+      const x = n.start * sx, w = Math.max(1.5, (n.end - n.start) * sx);
+      const y = H - (n.pitch - pMin + 1) * keyH;
+      g.globalAlpha = 0.18;
+      g.fillRect(x, y + 1, w, keyH - 2);
+    }
   }
   for (const n of notes) {
     const x = n.start * sx, w = Math.max(2, (n.end - n.start) * sx);
@@ -552,19 +721,6 @@ function nsToNotes(ns) {
   }
   return out;
 }
-async function transcribeNeural(file) {
-  const model = await ensureModel();
-  log("🧠 neural transcription running — a 3-4 min song can take 30-120 s, keep this tab open…");
-  const t0 = performance.now();
-  const ns = await model.transcribeFromAudioFile(file);
-  const notes = nsToNotes(ns);
-  log("🧠 neural engine extracted " + notes.length + " notes in " +
-      ((performance.now() - t0) / 1000).toFixed(0) + "s");
-  const dur = (ns.totalTime && ns.totalTime > 1) ? ns.totalTime
-            : Math.max(1, ...notes.map(n => n.end));
-  return { notes, duration: dur };
-}
-
 /* ================= orchestration ================= */
 async function transcribeBuffer(raw, label) {
   const cfg = { ...PRESETS[$("quality").value] };
@@ -613,7 +769,13 @@ function finish(result, label) {
   $("stats").textContent = notes.length + " notes · 🫲" + bass + " 🫱" + (notes.length - bass) +
     " · " + bpm.toFixed(1) + " BPM · " + (bytes.length / 1024).toFixed(1) + " KB";
   $("stage").style.display = "block";
-  drawRoll(notes, duration);
+  drawRoll(notes, duration, refNotes);
+  if (refNotes.length) {
+    const sc = compareToRef(notes, refNotes);
+    $("refstats").textContent = sc
+      ? "vs reference: precision " + (sc.precision * 100).toFixed(0) + "% · recall " + (sc.recall * 100).toFixed(0) + "%"
+      : "";
+  }
   $("play").disabled = false;
   $("stop").disabled = false;
   log("✔ done! 🎧 press ▶ play result to check it, then ⬇ DOWNLOAD .MID");
@@ -625,9 +787,23 @@ async function handleFile(file) {
   $("stage").style.display = "none"; $("play").disabled = true; $("stop").disabled = true;
   const useNeural = $("engine").value === "neural";
   try {
+    // decode locally first (needed for segmentation + DSP fallback either way)
+    log("decoding " + file.name + " …");
+    const buf = await file.arrayBuffer();
+    const AC0 = window.AudioContext || window.webkitAudioContext;
+    if (!AC0) throw new Error("WebAudio not supported in this browser 😢");
+    const ac0 = new AC0();
+    let audio0;
+    try {
+      audio0 = await ac0.decodeAudioData(buf);
+    } catch (e) {
+      throw new Error("browser failed to decode this file. Try a .wav version, or Chrome/Edge. (" + e.message + ")");
+    }
+    ac0.close();
+    const raw0 = resampleTo(mixDown(audio0), audio0.sampleRate, SR);
     if (useNeural) {
       try {
-        const result = await transcribeNeural(file);
+        const result = await transcribeNeuralAny(raw0, audio0.sampleRate);
         result.bpm = parseFloat($("bpm").value) || estimateBpmNotes(result.notes);
         finish(result, file.name);
         return;
@@ -637,20 +813,9 @@ async function handleFile(file) {
       }
     }
     // ---- classic DSP path ----
-    log("decoding " + file.name + " …");
-    const buf = await file.arrayBuffer();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) throw new Error("WebAudio not supported in this browser 😢");
-    const ac = new AC();
-    let audio;
-    try {
-      audio = await ac.decodeAudioData(buf);
-    } catch (e) {
-      throw new Error("browser failed to decode this file. Try a .wav version, or Chrome/Edge. (" + e.message + ")");
-    }
-    ac.close();
+    const audio = audio0;
     log("decoded " + audio.duration.toFixed(1) + "s @ " + audio.sampleRate + "Hz → resampled " + SR + "Hz");
-    const raw = resampleTo(mixDown(audio), audio.sampleRate, SR);
+    const raw = raw0;
     let peak = 0;
     for (let i = 0; i < raw.length; i++) { const v = Math.abs(raw[i]); if (v > peak) peak = v; }
     if (peak < 0.01) throw new Error("audio is silent (peak=" + peak.toFixed(4) + ")");
@@ -767,6 +932,28 @@ $("demo").addEventListener("click", runDemo);
 $("selftest").addEventListener("click", selfTest);
 $("play").addEventListener("click", () => lastResult && playNotes(lastResult.notes));
 $("stop").addEventListener("click", stopPlayback);
+
+/* ================= reference midi loader ================= */
+let refNotes = [];
+$("refbtn").addEventListener("click", () => $("reffile").click());
+$("reffile").addEventListener("change", async () => {
+  const f = $("reffile").files[0];
+  if (!f) return;
+  try {
+    const buf = await f.arrayBuffer();
+    refNotes = parseRefMidi(new Uint8Array(buf));
+    log("📐 reference loaded: " + f.name + " — " + refNotes.length + " notes");
+    if (lastResult) {
+      drawRoll(lastResult.notes, lastResult.duration, refNotes);
+      const sc = compareToRef(lastResult.notes, refNotes);
+      $("refstats").textContent = sc
+        ? "vs reference: precision " + (sc.precision * 100).toFixed(0) + "% · recall " + (sc.recall * 100).toFixed(0) + "%"
+        : "";
+    }
+  } catch (e) {
+    log("📐 reference parse failed: " + e.message, true);
+  }
+});
 </script>
 </body>
 </html>
